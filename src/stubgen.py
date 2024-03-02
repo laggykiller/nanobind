@@ -52,6 +52,7 @@ specifically to simplify stub generation.
 """
 
 import argparse
+import builtins
 from inspect import Signature, Parameter, signature, ismodule, getmembers
 import textwrap
 import importlib
@@ -59,7 +60,7 @@ import importlib.machinery
 import types
 import typing
 from dataclasses import dataclass
-from typing import Dict, Sequence, List, Optional, Callable, Tuple, cast
+from typing import Dict, Sequence, List, Optional, Tuple, cast, Generator, Any, Callable, Union
 import re
 import sys
 
@@ -81,11 +82,40 @@ SKIP_LIST = [
 ]
 # fmt: on
 
+# (name, desired_as_name) -> actual_as_name
+ImportDict = Dict[Tuple[Optional[str], Optional[str]], Optional[str]]
+# package_name -> ((name, desired_as_name) -> actual_as_name)
+PackagesDict = Dict[str, ImportDict]
+
+# (signature_str, doc_str, default_arg_1, default_arg_2, ...)
+if sys.version_info >= (3, 11):
+    NbSignature = Tuple[Optional[str], Optional[str], *Tuple[Any, ...]] # type: ignore
+else:
+    NbSignature = Tuple[Optional[str], Optional[str]]
+NbGetterSetterSignature = Tuple[str, str]
+
+class NbObject(object):
+    __nb_signature__: Tuple[NbSignature, ...]
+
+class NbFunction(object):
+    __nb_signature__: Tuple[NbSignature, ...]
+    __func__: "NbFunction"
+    def __call__(self, *arg: Any, **kwargs: Any) -> Any: ...
+
+class NbGetterSetter(object):
+    __nb_signature__: Tuple[NbGetterSetterSignature, ...]
+
+class NbProperty(object):
+    fget: NbGetterSetter
+    fset: NbGetterSetter
+
+class NbType(type):
+    __nb_signature__: str
 
 @dataclass
 class Pattern:
     # A replacement patterns as produced by ``load_pattern_file()`` below
-    query: re.Pattern
+    query: re.Pattern[str]
     lines: List[str]
     matches: int
 
@@ -130,9 +160,7 @@ class StubGen:
 
         # Dictionary to keep track of import directives added by the stub generator
         # Maps package_name -> ((name, desired_as_name) -> actual_as_name)
-        self.imports: Dict[
-            str, Dict[Tuple[Optional[str], Optional[str]], Optional[str]]
-        ] = {}
+        self.imports: PackagesDict = {}
 
         # ---------- Regular expressions ----------
 
@@ -192,7 +220,7 @@ class StubGen:
         docstr = f'{raw_str}"""{docstr}"""\n'
         self.write_par(docstr)
 
-    def put_nb_overload(self, fn, sig: List, name: Optional[str] = None) -> None:
+    def put_nb_overload(self, fn: NbFunction, sig: NbSignature, name: Optional[str] = None) -> None:
         """
         The ``put_nb_func()`` repeatedly calls this method to render the
         individual method overloads.
@@ -239,6 +267,7 @@ class StubGen:
                 if arg_str is None:
                     arg_str = "..."
 
+            assert isinstance(arg_str, str)
             assert (
                 "\n" not in arg_str
             ), "Default argument string may not contain newlines."
@@ -264,7 +293,7 @@ class StubGen:
             self.depth -= 1
         self.write("\n")
 
-    def put_nb_func(self, fn, name: Optional[str] = None) -> None:
+    def put_nb_func(self, fn: NbFunction, name: Optional[str] = None) -> None:
         """Append a nanobind function binding to the stub"""
         sigs = fn.__nb_signature__
         count = len(sigs)
@@ -279,7 +308,7 @@ class StubGen:
                 self.write_ln(f"@{overload}")
                 self.put_nb_overload(fn, s, name)
 
-    def put_function(self, fn, name: Optional[str] = None, parent=None):
+    def put_function(self, fn: NbFunction, name: Optional[str] = None, parent: Optional[object] = None):
         """Append a function of an arbitrary type to the stub"""
         # Don't generate a constructor for nanobind classes that aren't constructible
         if name == "__init__" and type(parent).__name__.startswith("nb_type"):
@@ -313,7 +342,7 @@ class StubGen:
         if name is None:
             name = fn.__name__
 
-        overloads: Sequence[Callable] = []
+        overloads: Sequence[Callable[..., Any]] = []
         if hasattr(fn, "__module__"):
             if sys.version_info >= (3, 11, 0):
                 overloads = typing.get_overloads(fn)
@@ -350,7 +379,7 @@ class StubGen:
                 self.depth -= 1
             self.write("\n")
 
-    def put_property(self, prop, name):
+    def put_property(self, prop: property, name: Optional[str]):
         """Append a Python 'property' object"""
         fget, fset = prop.fget, prop.fset
         self.write_ln("@property")
@@ -362,6 +391,8 @@ class StubGen:
                 type(fget).__module__ == "nanobind"
                 and type(fset).__module__ == "nanobind"
             ):
+                fget = cast(NbGetterSetter, fget)
+                fset = cast(NbGetterSetter, fset)
                 doc1 = fget.__nb_signature__[0][1]
                 doc2 = fset.__nb_signature__[0][1]
                 if doc1 and doc2 and doc1 == doc2:
@@ -369,7 +400,7 @@ class StubGen:
             self.put(prop.fset, name=name)
             self.include_docstrings = docstrings_backup
 
-    def put_nb_static_property(self, name, prop):
+    def put_nb_static_property(self, name: Optional[str], prop: NbProperty):
         """Append a 'nb_static_property' object"""
         getter_sig = prop.fget.__nb_signature__[0][0]
         getter_sig = getter_sig[getter_sig.find("/) -> ") + 6 :]
@@ -378,7 +409,7 @@ class StubGen:
             self.put_docstr(prop.__doc__)
         self.write("\n")
 
-    def put_type(self, tp, name):
+    def put_type(self, tp: NbType, name: Optional[str]):
         """Append a 'nb_type' type object"""
         if name and (name != tp.__name__ or self.module.__name__ != tp.__module__):
             if self.module.__name__ == tp.__module__:
@@ -451,7 +482,7 @@ class StubGen:
         """Check if the given type is an enumeration"""
         return hasattr(tp, "@entries")
 
-    def is_function(self, tp) -> bool:
+    def is_function(self, tp: type) -> bool:
         """
         Test if this is one of the many types of built-in functions supported
         by Python, or if it is a nanobind ``nb_func``.
@@ -466,7 +497,7 @@ class StubGen:
             or (tp.__module__ == "nanobind" and tp.__name__ == "nb_func")
         )
 
-    def put_value(self, value: object, name: str, parent=None, abbrev=True) -> None:
+    def put_value(self, value: object, name: str, parent: Optional[object] = None, abbrev: bool = True) -> None:
         """
         Render a ``name: type = value`` assignment at the module, class, or
         enum scope.
@@ -484,7 +515,7 @@ class StubGen:
             self.write("\n")
         elif self.is_function(tp) or isinstance(value, type):
             # This is a function or a type, import it from its actual source
-            self.import_object(value.__module__, value.__name__, name)  # type: ignore
+            self.import_object(value.__module__, value.__name__, name)
         else:
             value_str = self.expr_str(value, abbrev)
 
@@ -493,7 +524,7 @@ class StubGen:
 
             # Catch a few different typing.* constructs
             if issubclass(tp, typing.TypeVar) or (
-                hasattr(typing, "TypeVarTuple") and issubclass(tp, typing.TypeVarTuple)
+                sys.version_info >= (3, 11) and issubclass(tp, typing.TypeVarTuple)
             ):
                 types = ""
             elif typing.get_origin(value):
@@ -527,7 +558,7 @@ class StubGen:
         """
 
         # Process nd-array type annotations so that MyPy accepts them
-        def process_ndarray(m: re.Match) -> str:
+        def process_ndarray(m: re.Match[str]) -> str:
             s = m.group(2)
 
             ndarray = self.import_object("numpy.typing", "ArrayLike")
@@ -543,7 +574,7 @@ class StubGen:
         s = self.ndarray_re.sub(process_ndarray, s)
 
         # Process other type names and add suitable import statements
-        def process_general(m: re.Match) -> str:
+        def process_general(m: re.Match[str]) -> str:
             full_name, mod_name, cls_name = m.group(0), m.group(1)[:-1], m.group(2)
 
             if mod_name == "builtins":
@@ -564,7 +595,7 @@ class StubGen:
 
         return s
 
-    def apply_pattern(self, value: object, pattern: Pattern, match: re.Match) -> None:
+    def apply_pattern(self, value: NbObject, pattern: Pattern, match: re.Match[str]) -> None:
         """
         Called when ``value`` matched an entry of a pattern file
         """
@@ -578,7 +609,7 @@ class StubGen:
                     "nb_func",
                     "nb_method",
                 ):
-                    for tp_i in value.__nb_signature__:  # type: ignore
+                    for tp_i in value.__nb_signature__:
                         doc = tp_i[1]
                         if doc:
                             break
@@ -612,7 +643,7 @@ class StubGen:
                 line = line.replace(f"\\{k}", v)
             self.write_ln(line)
 
-    def put(self, value: object, name: Optional[str] = None, parent=None) -> None:
+    def put(self, value: object, name: Optional[str] = None, parent: Optional[object] = None) -> None:
         old_prefix = self.prefix
 
         if value in self.stack:
@@ -629,6 +660,7 @@ class StubGen:
                     match = pattern.query.search(self.prefix)
                     if match:
                         # If so, don't recurse
+                        value = cast(NbObject, value)
                         self.apply_pattern(value, pattern, match)
                         return
 
@@ -665,16 +697,21 @@ class StubGen:
                 for name, child in getmembers(value):
                     self.put(child, name=name, parent=value)
             elif self.is_function(tp):
+                value = cast(NbFunction, value)
                 self.put_function(value, name, parent)
             elif issubclass(tp, type):
+                value = cast(NbType, value)
                 self.put_type(value, name)
             elif tp_mod == "nanobind":
                 if tp_name == "nb_method":
+                    value = cast(NbFunction, value)
                     self.put_nb_func(value, name)
                 elif tp_name == "nb_static_property":
+                    value = cast(NbProperty, value)
                     self.put_nb_static_property(name, value)
             elif tp_mod == "builtins":
                 if tp is property:
+                    value = cast(property, value)
                     self.put_property(value, name)
                 else:
                     assert name is not None
@@ -710,7 +747,7 @@ class StubGen:
             module_short = module
 
         # Query a cache of previously imported objects
-        imports_module = self.imports.get(module_short, None)
+        imports_module: Optional[ImportDict] = self.imports.get(module_short, None)
         if not imports_module:
             imports_module = {}
             self.imports[module_short] = imports_module
@@ -751,14 +788,14 @@ class StubGen:
         imports_module[key] = final_name
         return final_name if final_name else ""
 
-    def expr_str(self, e, abbrev=True):
+    def expr_str(self, e: Any, abbrev: bool = True) -> Optional[str]:
         """
         Attempt to convert a value into valid Python syntax that regenerates
         that value. When ``abbrev`` is True, give up and replace with '...' if
         the expression is too complicated to be included in the stubs
         """
         tp = type(e)
-        for t in [bool, int, type(None), type(...)]:
+        for t in [bool, int, type(None), type(builtins.Ellipsis)]:
             if issubclass(tp, t):
                 return repr(e)
         if issubclass(tp, float):
@@ -773,14 +810,16 @@ class StubGen:
             return self.type_str(e)
         elif issubclass(tp, typing.ForwardRef):
             return f'"{e.__forward_arg__}"'
-        elif hasattr(typing, "TypeVarTuple") and issubclass(tp, typing.TypeVarTuple):
+        elif sys.version_info >= (3, 11) and issubclass(tp, typing.TypeVarTuple):
             tv = self.import_object("typing", "TypeVarTuple")
             return f'{tv}("{e.__name__}")'
         elif issubclass(tp, typing.TypeVar):
             tv = self.import_object("typing", "TypeVar")
             s = f'{tv}("{e.__name__}"'
             for v in getattr(e, "__constraints__", ()):
-                s += ", " + self.expr_str(v)
+                v = self.expr_str(v)
+                assert v
+                s += ", " + v
             for k in ["contravariant", "covariant", "bound", "infer_variance"]:
                 v = getattr(e, f"__{k}__", None)
                 if v:
@@ -825,7 +864,7 @@ class StubGen:
     def signature_str(self, s: Signature):
         """Convert an inspect.Signature to into valid Python syntax"""
         posonly_sep, kwonly_sep = False, True
-        params = []
+        params: List[str] = []
 
         # Logic for placing '*' and '/' based on the
         # signature.Signature implementation
@@ -853,7 +892,7 @@ class StubGen:
             result += " -> " + self.type_str(s.return_annotation)
         return result
 
-    def param_str(self, p: Parameter):
+    def param_str(self, p: Parameter) -> str:
         result = ""
         if p.kind == Parameter.VAR_POSITIONAL:
             result += "*"
@@ -867,10 +906,12 @@ class StubGen:
             result += ": " + self.type_str(p.annotation)
         if has_def:
             result += " = " if has_type else "="
-            result += self.expr_str(p.default)
+            p_default_str = self.expr_str(p.default)
+            assert p_default_str
+            result += p_default_str
         return result
 
-    def type_str(self, tp):
+    def type_str(self, tp: Union[List[Any], Tuple[Any, ...], Dict[Any, Any], Any]) -> str:
         """Attempt to convert a type into a Python expression which reproduces it"""
         origin, args = typing.get_origin(tp), typing.get_args(tp)
 
@@ -879,20 +920,24 @@ class StubGen:
         elif isinstance(tp, typing.ForwardRef):
             return repr(tp.__forward_arg__)
         elif isinstance(tp, list):
-            return "[" + ", ".join(self.type_str(a) for a in tp) + "]"
+            list_gen: Generator[str, None, None] = (self.type_str(a) for a in tp)
+            return "[" + ", ".join(list_gen) + "]"
         elif isinstance(tp, tuple):
-            return "(" + ", ".join(self.type_str(a) for a in tp) + ")"
+            tuple_gen: Generator[str, None, None] = (self.type_str(a) for a in tp)
+            return "(" + ", ".join(tuple_gen) + ")"
         elif isinstance(tp, dict):
+            dict_gen: Generator[str, None, None] = (repr(k) + ": " + self.type_str(v) for k, v in tp.items())
             return (
                 "{"
-                + ", ".join(repr(k) + ": " + self.type_str(v) for k, v in tp.items())
+                + ", ".join(dict_gen)
                 + "}"
             )
         elif origin and args:
+            args_gen: Generator[str, None, None] = (self.type_str(a) for a in args)
             result = (
                 self.type_str(origin)
                 + "["
-                + ", ".join(self.type_str(a) for a in args)
+                + ", ".join(args_gen)
                 + "]"
             )
         elif tp is types.ModuleType:
@@ -909,7 +954,7 @@ class StubGen:
 
         for module in sorted(self.imports):
             imports = self.imports[module]
-            items = []
+            items: List[str] = []
 
             for (k, v1), v2 in imports.items():
                 if k is None:
@@ -1084,7 +1129,7 @@ def load_pattern_file(fname: str) -> List[Pattern]:
 
     patterns: List[Pattern] = []
 
-    def add_pattern(query, lines):
+    def add_pattern(query: str, lines: List[str]):
         # Exactly 1 empty line at the end
         while lines and lines[-1].isspace():
             lines.pop()
