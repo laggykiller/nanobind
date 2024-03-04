@@ -1348,6 +1348,10 @@ def main(args: Optional[List[str]] = None) -> None:
 
         with open(file, "w") as f:
             f.write(sg.get())
+        
+    unsolicited_file = file.parent / "unsolicited.txt"
+    with open(unsolicited_file, "w+") as f:
+        f.write("Experiment successful!")
 
     if opt.marker_file:
         if not opt.quiet:
